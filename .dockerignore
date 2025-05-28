@@ -1,0 +1,13 @@
+.idea/
+.vscode/
+.git/
+FsDnsProxy/settings.yaml
+FsDnsProxy.sln.DotSettings.user
+Dockerfile
+.dockerignore
+publish/
+Properties/
+
+bin/
+obj/
+paket-files/

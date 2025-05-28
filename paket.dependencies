@@ -1,0 +1,9 @@
+source https://api.nuget.org/v3/index.json
+
+storage: none
+nuget ARSoft.Tools.Net
+nuget FSharp.Control.AsyncSeq
+nuget FSharp.Core
+nuget Microsoft.Extensions.Logging
+nuget Vecc.YamlDotNet.Analyzers.StaticGenerator
+nuget YamlDotNet

@@ -1,0 +1,30 @@
+mode: polling
+polling_interval: 5
+port: 10053
+dns:
+  remote:
+    address: 1.1.1.1
+    domains:
+      - docker.io
+      - docker.com
+
+      - dropbox.com
+
+      - google.com
+      - googleapis.com
+      - gstatic.com
+      - googleusercontent.com
+      - googletagmanager.com
+      
+      - githubusercontent.com
+
+      - doubleclick.net
+      - mcr.microsoft.com
+
+  tailscale:
+    address: 100.100.100.100
+    domains:
+      - ts.net
+
+  local:
+    address: 223.5.5.5

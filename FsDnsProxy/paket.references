@@ -1,0 +1,5 @@
+ARSoft.Tools.Net
+FSharp.Core
+Microsoft.Extensions.Logging
+YamlDotNet
+FSharp.Control.AsyncSeq

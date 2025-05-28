@@ -1,0 +1,10 @@
+.idea/
+.vs/
+.fake
+FsDnsProxy.sln.DotSettings.user
+publish/
+Properties/
+
+bin/
+obj/
+paket-files/
