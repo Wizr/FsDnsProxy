@@ -4,6 +4,7 @@ storage: none
 nuget ARSoft.Tools.Net
 nuget FSharp.Control.AsyncSeq
 nuget FSharp.Core
-nuget Microsoft.Extensions.Logging
+nuget Serilog
+nuget Serilog.Sinks.Console
 nuget Vecc.YamlDotNet.Analyzers.StaticGenerator
 nuget YamlDotNet

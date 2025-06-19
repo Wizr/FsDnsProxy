@@ -1,8 +1,6 @@
 ﻿open FSharp.Core
 open FSharp.Control
-
-open ARSoft.Tools.Net
-open ARSoft.Tools.Net.Dns
+open Microsoft.FSharp.Collections
 
 open System
 open System.Net
@@ -10,19 +8,12 @@ open System.IO
 open System.Threading
 open System.Collections.Generic
 
-open Microsoft.Extensions.Logging
-open Microsoft.FSharp.Collections
+open ARSoft.Tools.Net
+open ARSoft.Tools.Net.Dns
+open Serilog
 
 
-let logger =
-    LoggerFactory
-        .Create(fun x ->
-            x.AddSimpleConsole(fun o ->
-                o.SingleLine <- true
-                o.IncludeScopes <- false)
-            |> ignore)
-        .CreateLogger
-        "FsDnsProxy"
+let logger = LoggerConfiguration().WriteTo.Console().CreateLogger()
 
 let mapWhere<'T> (pred: 'T -> bool) (map: 'T -> 'T) (value: 'T list) =
     List.map (fun s -> if pred s then map s else s) value
@@ -43,7 +34,6 @@ type SettingDNSServer =
 type Setting =
     { Id: Guid
       Servers: SettingDNSServer list
-      Fallback: SettingDNSServer
       PollingInterval: int
       Port: int }
 
@@ -66,14 +56,15 @@ module Setting =
         | _ ->
             Some
                 { Id = Guid.NewGuid()
-                  Servers = remotes |> List.take (remotes.Length - 1)
-                  Fallback = List.last remotes
+                  Servers = remotes
                   PollingInterval = setting.PollingInterval
                   Port = setting.Port }
 
     let chooseClient (domainName: DomainName) (servers: SettingDNSServer list) =
         servers
-        |> List.tryFindIndex (fun r -> r.Domains |> List.exists (fun d -> d = domainName || domainName.IsSubDomainOf d))
+        |> List.tryFindIndex (fun r ->
+            r.Domains.Length = 0
+            || r.Domains |> List.exists (fun d -> d = domainName || domainName.IsSubDomainOf d))
 
 [<NoComparison>]
 type ProcessorMessage =
@@ -85,8 +76,7 @@ type ProcessorMessage =
 type SettingState =
     { refCount: int
       setting: Setting
-      clients: DnsClient list
-      fallbackClient: DnsClient }
+      clients: DnsClient list }
 
 [<NoComparison>]
 type SettingStateAll =
@@ -100,13 +90,7 @@ type SettingStateAll =
                   setting = setting
                   clients =
                     setting.Servers
-                    |> List.map (fun s -> new DnsClient([ s.Address ], [| new UdpClientTransport(s.Port) |], true))
-                  fallbackClient =
-                    new DnsClient(
-                        [ setting.Fallback.Address ],
-                        [| new UdpClientTransport(setting.Fallback.Port) |],
-                        true
-                    ) }
+                    |> List.map (fun s -> new DnsClient([ s.Address ], [| new UdpClientTransport(s.Port) |], true)) }
 
         this.curStateId |> Option.iter this.releaseState
         this.curStateId <- Some setting.Id
@@ -123,8 +107,7 @@ type SettingStateAll =
     member this.releaseState(stateId: Guid) =
         match this.states[stateId].refCount with
         | 1 ->
-            this.states[stateId].fallbackClient :: this.states[stateId].clients
-            |> Seq.iter (fun x -> (x :> IDisposable).Dispose())
+            this.states[stateId].clients |> Seq.iter (fun x -> (x :> IDisposable).Dispose())
 
             this.states.Remove stateId |> ignore
         | _ ->
@@ -140,32 +123,32 @@ let ResolveDnsQuery (state: SettingState) (msg: DnsMessage) =
         | count when count > 0 ->
             let question = msg.Questions[0]
 
-            let setting, client =
+            let client =
                 Setting.chooseClient question.Name state.setting.Servers
-                |> Option.map (fun i -> state.setting.Servers[i], state.clients[i])
-                |> Option.defaultValue (state.setting.Fallback, state.fallbackClient)
+                |> Option.map (fun i -> state.clients[i])
 
-            logger.LogInformation $"'{setting.Name}' selected for domain {question.Name}"
+            match client with
+            | Some client ->
+                try
+                    let! upstreamResponse =
+                        client.ResolveAsync(
+                            question.Name,
+                            question.RecordType,
+                            question.RecordClass,
+                            DnsQueryOptions(IsRecursionDesired = true, IsEDnsEnabled = true)
+                        )
+                        |> Async.AwaitTask
 
-            try
-                let! upstreamResponse =
-                    client.ResolveAsync(
-                        question.Name,
-                        question.RecordType,
-                        question.RecordClass,
-                        DnsQueryOptions(IsRecursionDesired = true, IsEDnsEnabled = true)
-                    )
-                    |> Async.AwaitTask
-
-                match upstreamResponse |> Option.ofObj with
-                | None -> res.ReturnCode <- ReturnCode.ServerFailure
-                | Some upstreamResponse ->
-                    res.AnswerRecords <- upstreamResponse.AnswerRecords
-                    res.AdditionalRecords <- upstreamResponse.AdditionalRecords
-                    res.AuthorityRecords <- upstreamResponse.AuthorityRecords
-                    res.ReturnCode <- upstreamResponse.ReturnCode
-            with _ ->
-                res.ReturnCode <- ReturnCode.ServerFailure
+                    match upstreamResponse |> Option.ofObj with
+                    | None -> res.ReturnCode <- ReturnCode.ServerFailure
+                    | Some upstreamResponse ->
+                        res.AnswerRecords <- upstreamResponse.AnswerRecords
+                        res.AdditionalRecords <- upstreamResponse.AdditionalRecords
+                        res.AuthorityRecords <- upstreamResponse.AuthorityRecords
+                        res.ReturnCode <- upstreamResponse.ReturnCode
+                with _ ->
+                    res.ReturnCode <- ReturnCode.ServerFailure
+            | None -> res.ReturnCode <- ReturnCode.ServerFailure
         | _ -> res.ReturnCode <- ReturnCode.NoError
 
         return res
@@ -179,28 +162,16 @@ let QueryProcessor =
 
         AsyncSeq.initInfiniteAsync (fun _ -> inbox.Receive())
         |> AsyncSeq.map (fun msg ->
-            let stateStr =
-                statesAll.states
-                |> Seq.map (|KeyValue|)
-                |> Seq.map (fun (id, v) ->
-                    let isCur = if Some id = statesAll.curStateId then "*" else ""
-                    $"{isCur}{id}({v.refCount})")
-                |> Seq.toList
-
-            logger.LogInformation $"{msg.GetType().Name} states: %A{stateStr}"
 
             match msg with
             | SettingChanged setting ->
-                // logger.LogInformation $"[{nameof SettingChanged}]"
                 statesAll.addState setting
                 None
 
             | DnsQuery(dnsMessage, replyChannel) ->
-                logger.LogInformation $"[{nameof DnsQuery}]: %A{dnsMessage.Questions}"
                 statesAll.acquireState () |> Option.map (fun s -> s, dnsMessage, replyChannel)
 
             | ReleaseState setting ->
-                // logger.LogInformation $"[{nameof ReleaseState}]"
                 statesAll.releaseState setting.Id
                 None)
         |> AsyncSeq.choose id
@@ -253,8 +224,12 @@ let rec PollSetting (oldSetting: Setting option) (path: string) =
 
         let curSetting =
             Option.handleUpdate
-                (fun a b -> a.Servers <> b.Servers || a.Fallback <> b.Fallback)
-                (SettingChanged >> QueryProcessor.Post)
+                (fun a b -> a.Servers <> b.Servers)
+                (SettingChanged
+                 >> QueryProcessor.Post
+                 >> fun x ->
+                     logger.Information "Setting reloaded"
+                     x)
                 newSetting
                 oldSetting
 
@@ -268,7 +243,7 @@ let rec PollSetting (oldSetting: Setting option) (path: string) =
 [<EntryPoint>]
 let main args =
     if args.Length = 0 then
-        logger.LogInformation "usage: FsDnsProxy <config_file>.yaml\n\n  <config_file>.yaml required"
+        logger.Information "Usage: FsDnsProxy <config_file>.yaml\n\n  <config_file>.yaml required"
         1
     else
         let setting =
@@ -280,12 +255,12 @@ let main args =
 
         QueryProcessor.Post(SettingChanged setting)
         let server = LocalServer setting.Port
-        logger.LogInformation $"Listening on port: {setting.Port}"
+        logger.Information $"Listening on port: {setting.Port}"
         server.Start()
-        logger.LogInformation "local server started"
+        logger.Information "Local server started"
 
         PollSetting (Some setting) args[0] |> Async.RunSynchronously
 
         server.Stop()
-        logger.LogInformation "local server stopped"
+        logger.Information "Local server stopped"
         0
