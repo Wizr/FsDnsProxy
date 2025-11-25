@@ -1,6 +1,7 @@
 mode: polling
 polling_interval: 5
 port: 10053
+log_level: Warning
 dns:
   remote:
     address:

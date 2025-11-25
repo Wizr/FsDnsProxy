@@ -11,10 +11,26 @@ open System.Collections.Generic
 open ARSoft.Tools.Net
 open ARSoft.Tools.Net.Dns
 open Serilog
+open Serilog.Core
+open Serilog.Events
 
+
+type LogLevelSwitch() =
+    inherit LoggingLevelSwitch()
+
+    member this.SetMinimumLevel(level: string) =
+        let ok, level = Enum.TryParse<LogEventLevel> level
+
+        if ok then
+            this.MinimumLevel <- level
+
+        ()
+
+let logLevelSwitch = LogLevelSwitch()
 
 let logger =
     LoggerConfiguration()
+        .MinimumLevel.ControlledBy(logLevelSwitch)
         .WriteTo.Console(outputTemplate = "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level}] {Message}{NewLine}{Exception}")
         .CreateLogger()
 
@@ -46,7 +62,8 @@ module YamlSetting =
         { Id: Guid
           Servers: SettingDNSServer list
           PollingInterval: int
-          Port: int }
+          Port: int
+          LogLevel: string }
 
     let fromSetting (setting: YamlParser.Setting) =
         let remotes =
@@ -66,7 +83,8 @@ module YamlSetting =
                 { Id = Guid.NewGuid()
                   Servers = remotes
                   PollingInterval = setting.PollingInterval
-                  Port = setting.Port }
+                  Port = setting.Port
+                  LogLevel = setting.LogLevel }
 
     let chooseClient (domainName: DomainName) (servers: SettingDNSServer list) =
         servers
@@ -251,6 +269,7 @@ module Option =
 
             Some a
 
+
 let rec PollSetting (oldSetting: YamlSetting.Setting option) (path: string) =
     async {
         match ParseSetting path with
@@ -261,12 +280,11 @@ let rec PollSetting (oldSetting: YamlSetting.Setting option) (path: string) =
             let curSetting =
                 (newSetting, oldSetting)
                 ||> Option.handleUpdate
-                        (fun a b -> a.Servers <> b.Servers)
-                        (SettingChanged
-                         >> QueryProcessor.Post
-                         >> fun x ->
-                             logger.Information "Setting reloaded"
-                             x)
+                    (fun a b -> a.Servers <> b.Servers || a.LogLevel <> b.LogLevel)
+                    (fun newSetting ->
+                        SettingChanged newSetting |> QueryProcessor.Post
+                        logLevelSwitch.SetMinimumLevel newSetting.LogLevel
+                        logger.Information "Setting reloaded")
 
             let pollingInterval =
                 curSetting |> Option.map _.PollingInterval |> Option.defaultValue 1

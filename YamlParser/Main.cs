@@ -35,6 +35,7 @@ public class Setting
     public string Mode { get; set; } = "";
     public int PollingInterval { get; set; } = 5;
     public int Port { get; set; } = 53;
+    public string LogLevel { get; set; } = string.Empty;
     public Dictionary<string, SettingDns> Dns { get; set; } = [];
 }
 
