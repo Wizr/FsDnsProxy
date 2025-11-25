@@ -13,7 +13,10 @@ open ARSoft.Tools.Net.Dns
 open Serilog
 
 
-let logger = LoggerConfiguration().WriteTo.Console().CreateLogger()
+let logger =
+    LoggerConfiguration()
+        .WriteTo.Console(outputTemplate = "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level}] {Message}{NewLine}{Exception}")
+        .CreateLogger()
 
 let mapWhere<'T> (pred: 'T -> bool) (map: 'T -> 'T) (value: 'T list) =
     List.map (fun s -> if pred s then map s else s) value
@@ -21,34 +24,39 @@ let mapWhere<'T> (pred: 'T -> bool) (map: 'T -> 'T) (value: 'T list) =
 let serializer = YamlParser.Parser.Create()
 
 let ParseSetting (path: string) =
-    serializer.Deserialize<YamlParser.Setting>(File.ReadAllText path)
+    try
+        serializer.Deserialize<YamlParser.Setting>(File.ReadAllText path) |> Some
+    with e ->
+        logger.Error(e, "Deserialize Yaml Failed")
+        None
 
-[<NoComparison>]
-type SettingDNSServer =
-    { Name: string
-      Domains: DomainName list
-      Address: IPAddress
-      Port: int }
-
-[<NoComparison>]
-type Setting =
-    { Id: Guid
-      Servers: SettingDNSServer list
-      PollingInterval: int
-      Port: int }
 
 [<RequireQualifiedAccess>]
 [<CompilationRepresentation(CompilationRepresentationFlags.ModuleSuffix)>]
-module Setting =
+module YamlSetting =
+    [<NoComparison>]
+    type SettingDNSServer =
+        { Name: string
+          Domains: DomainName list
+          Address: IPEndPoint list
+          Address6: IPEndPoint list }
+
+    [<NoComparison>]
+    type Setting =
+        { Id: Guid
+          Servers: SettingDNSServer list
+          PollingInterval: int
+          Port: int }
+
     let fromSetting (setting: YamlParser.Setting) =
         let remotes =
             setting.Dns
             |> Seq.map (|KeyValue|)
             |> Seq.map (fun (name, d) ->
                 { Name = name
-                  Domains = d.Domains |> Seq.toList
-                  Address = d.Address
-                  Port = d.Port })
+                  Domains = d.Domains |> List.ofSeq
+                  Address = d.Address |> List.ofSeq
+                  Address6 = d.Address6 |> List.ofSeq })
             |> Seq.toList
 
         match remotes with
@@ -66,87 +74,106 @@ module Setting =
             r.Domains.Length = 0
             || r.Domains |> List.exists (fun d -> d = domainName || domainName.IsSubDomainOf d))
 
-[<NoComparison>]
-type ProcessorMessage =
-    | SettingChanged of Setting
-    | DnsQuery of DnsMessage * AsyncReplyChannel<DnsMessage>
-    | ReleaseState of Setting
+module SettingStore =
+    [<NoComparison>]
+    type State =
+        { refCount: int
+          setting: YamlSetting.Setting
+          clients: DnsClient list list }
 
-[<NoComparison>]
-type SettingState =
-    { refCount: int
-      setting: Setting
-      clients: DnsClient list }
+    [<NoComparison>]
+    type Store =
+        { mutable curStateId: Guid option
+          mutable states: Dictionary<Guid, State> }
 
-[<NoComparison>]
-type SettingStateAll =
-    { mutable curStateId: Guid option
-      mutable states: Dictionary<Guid, SettingState> }
+        member this.addState(setting: YamlSetting.Setting) =
+            if not (this.states.ContainsKey setting.Id) then
+                this.states[setting.Id] <-
+                    { refCount = 1
+                      setting = setting
+                      clients =
+                        setting.Servers
+                        |> List.map (fun s ->
+                            let c4 =
+                                s.Address
+                                |> List.map (fun e ->
+                                    new DnsClient([ e.Address ], [| new UdpClientTransport(e.Port) |], true, 1000))
 
-    member this.addState(setting: Setting) =
-        if not (this.states.ContainsKey setting.Id) then
-            this.states[setting.Id] <-
-                { refCount = 1
-                  setting = setting
-                  clients =
-                    setting.Servers
-                    |> List.map (fun s -> new DnsClient([ s.Address ], [| new UdpClientTransport(s.Port) |], true)) }
+                            let c6 =
+                                s.Address6
+                                |> List.map (fun e ->
+                                    new DnsClient([ e.Address ], [| new UdpClientTransport(e.Port) |], true, 1000))
 
-        this.curStateId |> Option.iter this.releaseState
-        this.curStateId <- Some setting.Id
+                            c4 @ c6) }
 
-    member this.acquireState() =
-        this.curStateId
-        |> Option.map (fun x ->
-            this.states[x] <-
-                { this.states[x] with
-                    refCount = this.states[x].refCount + 1 }
+            this.curStateId |> Option.iter this.releaseState
+            this.curStateId <- Some setting.Id
 
-            this.states[x])
+        member this.acquireState() =
+            this.curStateId
+            |> Option.map (fun x ->
+                this.states[x] <-
+                    { this.states[x] with
+                        refCount = this.states[x].refCount + 1 }
 
-    member this.releaseState(stateId: Guid) =
-        match this.states[stateId].refCount with
-        | 1 ->
-            this.states[stateId].clients |> Seq.iter (fun x -> (x :> IDisposable).Dispose())
+                this.states[x])
 
-            this.states.Remove stateId |> ignore
-        | _ ->
-            this.states[stateId] <-
-                { this.states[stateId] with
-                    refCount = this.states[stateId].refCount - 1 }
+        member this.releaseState(stateId: Guid) =
+            match this.states[stateId].refCount with
+            | 1 ->
+                this.states[stateId].clients
+                |> Seq.concat
+                |> Seq.iter (fun x -> (x :> IDisposable).Dispose())
 
-let ResolveDnsQuery (state: SettingState) (msg: DnsMessage) =
+                this.states.Remove stateId |> ignore
+            | _ ->
+                this.states[stateId] <-
+                    { this.states[stateId] with
+                        refCount = this.states[stateId].refCount - 1 }
+
+let ResolveDnsQuery (state: SettingStore.State) (msg: DnsMessage) =
     async {
         let res = msg.CreateResponseInstance()
 
         match msg.Questions.Count with
         | count when count > 0 ->
             let question = msg.Questions[0]
+            logger.Debug("Question: {question}", question)
 
-            let client =
-                Setting.chooseClient question.Name state.setting.Servers
+            let clients =
+                YamlSetting.chooseClient question.Name state.setting.Servers
                 |> Option.map (fun i -> state.clients[i])
 
-            match client with
-            | Some client ->
+            match clients with
+            | Some clients ->
                 try
                     let! upstreamResponse =
-                        client.ResolveAsync(
-                            question.Name,
-                            question.RecordType,
-                            question.RecordClass,
-                            DnsQueryOptions(IsRecursionDesired = true, IsEDnsEnabled = true)
-                        )
-                        |> Async.AwaitTask
+                        clients
+                        |> List.map (fun client ->
+                            async {
+                                let! x =
+                                    client.ResolveAsync(
+                                        question.Name,
+                                        question.RecordType,
+                                        question.RecordClass,
+                                        DnsQueryOptions(IsRecursionDesired = true, IsEDnsEnabled = true)
+                                    )
+                                    |> Async.AwaitTask
 
-                    match upstreamResponse |> Option.ofObj with
-                    | None -> res.ReturnCode <- ReturnCode.ServerFailure
-                    | Some upstreamResponse ->
+                                return Some x
+                            })
+                        |> Async.Choice
+
+                    match upstreamResponse |> Option.map Option.ofObj with
+                    | None
+                    | Some None -> res.ReturnCode <- ReturnCode.ServerFailure
+                    | Some(Some upstreamResponse) ->
                         res.AnswerRecords <- upstreamResponse.AnswerRecords
                         res.AdditionalRecords <- upstreamResponse.AdditionalRecords
                         res.AuthorityRecords <- upstreamResponse.AuthorityRecords
                         res.ReturnCode <- upstreamResponse.ReturnCode
-                with _ ->
+                with e ->
+                    logger.Error(e, "Resolve Error")
                     res.ReturnCode <- ReturnCode.ServerFailure
             | None -> res.ReturnCode <- ReturnCode.ServerFailure
         | _ -> res.ReturnCode <- ReturnCode.NoError
@@ -154,9 +181,15 @@ let ResolveDnsQuery (state: SettingState) (msg: DnsMessage) =
         return res
     }
 
+[<NoComparison>]
+type ProcessorMessage =
+    | SettingChanged of YamlSetting.Setting
+    | DnsQuery of DnsMessage * AsyncReplyChannel<DnsMessage>
+    | ReleaseState of YamlSetting.Setting
+
 let QueryProcessor =
     MailboxProcessor<ProcessorMessage>.Start(fun inbox ->
-        let statesAll =
+        let statesAll: SettingStore.Store =
             { curStateId = None
               states = Dictionary() }
 
@@ -218,26 +251,28 @@ module Option =
 
             Some a
 
-let rec PollSetting (oldSetting: Setting option) (path: string) =
+let rec PollSetting (oldSetting: YamlSetting.Setting option) (path: string) =
     async {
-        let newSetting = ParseSetting path |> Setting.fromSetting
+        match ParseSetting path with
+        | None -> return! PollSetting oldSetting path
+        | Some _setting ->
+            let newSetting = YamlSetting.fromSetting _setting
 
-        let curSetting =
-            Option.handleUpdate
-                (fun a b -> a.Servers <> b.Servers)
-                (SettingChanged
-                 >> QueryProcessor.Post
-                 >> fun x ->
-                     logger.Information "Setting reloaded"
-                     x)
-                newSetting
-                oldSetting
+            let curSetting =
+                (newSetting, oldSetting)
+                ||> Option.handleUpdate
+                        (fun a b -> a.Servers <> b.Servers)
+                        (SettingChanged
+                         >> QueryProcessor.Post
+                         >> fun x ->
+                             logger.Information "Setting reloaded"
+                             x)
 
-        let pollingInterval =
-            curSetting |> Option.map _.PollingInterval |> Option.defaultValue 1
+            let pollingInterval =
+                curSetting |> Option.map _.PollingInterval |> Option.defaultValue 1
 
-        do! Async.Sleep(TimeSpan(0, 0, pollingInterval))
-        return! PollSetting curSetting path
+            do! Async.Sleep(TimeSpan(0, 0, pollingInterval))
+            return! PollSetting curSetting path
     }
 
 [<EntryPoint>]
@@ -249,7 +284,7 @@ let main args =
         let setting =
             Seq.initInfinite (fun _ ->
                 Thread.Sleep(TimeSpan(0, 0, 1))
-                ParseSetting args[0] |> Setting.fromSetting)
+                ParseSetting args[0] |> Option.bind YamlSetting.fromSetting)
             |> Seq.choose id
             |> Seq.head
 

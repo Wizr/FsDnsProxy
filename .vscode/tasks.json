@@ -6,9 +6,12 @@
 			"problemMatcher": [
 				"$msCompile"
 			],
-			"group": "build",
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
 			"label": "Build: FsDnsProxy.fsproj",
 			"detail": "Build the FsDnsProxy.fsproj project using dotnet build"
-		}
+		},
 	]
 }

@@ -9,18 +9,17 @@ using YamlDotNet.Serialization.NamingConventions;
 
 public class SettingDns
 {
-    public IPAddress Address { get; set; } = new IPAddress(0);
-    public int Port { get; set; } = 53;
+    public List<IPEndPoint> Address { get; set; } = [];
+    public List<IPEndPoint> Address6 { get; set; } = [];
     public List<DomainName> Domains { get; set; } = [];
 
     public override bool Equals(object? obj)
     {
         if (obj is SettingDns dns)
         {
-            return Address.Equals(dns.Address)
-                && Port == dns.Port
-                && Domains.Except(dns.Domains).ToList().Count == 0
-                && dns.Domains.Except(Domains).ToList().Count == 0;
+            return Address.ToHashSet().SetEquals(dns.Address.ToHashSet())
+                && Address6.ToHashSet().SetEquals(dns.Address6.ToHashSet())
+                && Domains.ToHashSet().SetEquals(dns.Domains.ToHashSet());
         }
         return false;
     }
@@ -70,17 +69,22 @@ class DomainNameConverter : IYamlTypeConverter
     }
 }
 
-class IPAddressConverter : IYamlTypeConverter
+class IPEndPointConverter : IYamlTypeConverter
 {
     public bool Accepts(Type type)
     {
-        return type == typeof(IPAddress);
+        return type == typeof(IPEndPoint);
     }
 
     public object? ReadYaml(IParser parser, Type type, ObjectDeserializer rootDeserializer)
     {
         var value = parser.Consume<Scalar>().Value;
-        return IPAddress.Parse(value);
+        var endpoint = IPEndPoint.Parse(value);
+        if (endpoint.Port == 0)
+        {
+            endpoint.Port = 53;
+        }
+        return endpoint;
     }
 
     public void WriteYaml(IEmitter emitter, object? value, Type type, ObjectSerializer serializer)
@@ -113,7 +117,7 @@ public class Parser
         return new StaticDeserializerBuilder(new StaticContext())
             .WithNamingConvention(UnderscoredNamingConvention.Instance)
             .WithTypeConverter(new DomainNameConverter())
-            .WithTypeConverter(new IPAddressConverter())
+            .WithTypeConverter(new IPEndPointConverter())
             .Build();
     }
 }

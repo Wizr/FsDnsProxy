@@ -9,7 +9,7 @@
             "type": "coreclr",
             "request": "launch",
             "preLaunchTask": "Build: FsDnsProxy.fsproj",
-            "program": "${workspaceFolder}/FsDnsProxy/bin/Debug/net9.0/FsDnsProxy.dll",
+            "program": "${workspaceFolder}/FsDnsProxy/bin/Debug/net10.0/FsDnsProxy.dll",
             "args": ["settings.yaml"],
             "cwd": "${workspaceFolder}/FsDnsProxy",
             "stopAtEntry": false,

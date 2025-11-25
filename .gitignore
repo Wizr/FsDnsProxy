@@ -1,10 +1,10 @@
 .idea/
 .vs/
 .fake
+.DS_Store
 FsDnsProxy.sln.DotSettings.user
 publish/
 Properties/
 
 bin/
 obj/
-paket-files/
